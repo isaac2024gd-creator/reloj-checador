@@ -223,7 +223,7 @@ export default function SuperAdmin() {
 function PanelClientes() {
   const [clientes, setClientes] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [showForm, setShowForm] = useState(false);
+  const [showForm, setShowForm] = useState(true);
   const [toast, setToast] = useState(null);
 
   // La clave verificada vive en memoria en el componente padre (SuperAdmin);
@@ -296,6 +296,7 @@ function PanelClientes() {
           <FormularioCliente
             pin={pin}
             onCreated={() => { setShowForm(false); loadClientes(); setToast({ text: "Cliente creado." }); }}
+            onCreatedKeepOpen={() => { loadClientes(); setToast({ text: "Cliente creado. Listo para el siguiente." }); }}
             onError={(msg) => setToast({ error: true, text: msg })}
             onToast={(text) => setToast({ text })}
           />
@@ -359,9 +360,10 @@ function PanelClientes() {
   );
 }
 
-function FormularioCliente({ pin, onCreated, onError, onToast }) {
+function FormularioCliente({ pin, onCreated, onCreatedKeepOpen, onError, onToast }) {
   const [nombreNegocio, setNombreNegocio] = useState("");
   const [plan, setPlan] = useState("basico");
+  const [showDueno, setShowDueno] = useState(false);
   const [nombreDueno, setNombreDueno] = useState("");
   const [emailDueno, setEmailDueno] = useState("");
   const [telefonoDueno, setTelefonoDueno] = useState("");
@@ -370,7 +372,18 @@ function FormularioCliente({ pin, onCreated, onError, onToast }) {
 
   const info = PLANES[plan];
 
+  function limpiarParaOtro() {
+    setNombreNegocio("");
+    setPlan("basico");
+    setShowDueno(false);
+    setNombreDueno("");
+    setEmailDueno("");
+    setTelefonoDueno("");
+    setResumen(null);
+  }
+
   async function crear() {
+    if (busy) return;
     if (!nombreNegocio.trim()) {
       onError("Falta el nombre del negocio.");
       return;
@@ -403,10 +416,6 @@ function FormularioCliente({ pin, onCreated, onError, onToast }) {
           <Check size={16} color={sage} />
           <div className="text-xs font-bold uppercase" style={{ color: ink }}>Cliente creado</div>
         </div>
-        <p className="text-xs mb-3" style={{ color: ink + "99" }}>
-          Todavía falta enviarle la invitación al dueño — por ahora hazlo tú manualmente (correo o WhatsApp)
-          con estos datos:
-        </p>
         <div className="text-xs rounded-sm p-3 mb-3" style={{ background: "#fff", border: `1px solid ${ink}22`, color: ink }}>
           <div><b>Negocio:</b> {resumen.nombre_negocio}</div>
           <div><b>Plan:</b> {PLANES[resumen.plan]?.nombre} — {money(resumen.precio_mensual)}</div>
@@ -416,7 +425,7 @@ function FormularioCliente({ pin, onCreated, onError, onToast }) {
         </div>
 
         <p className="text-xs mb-2" style={{ color: ink + "99" }}>
-          Su link privado (mándaselo junto con lo de arriba — con él configura su propia clave la primera vez):
+          Link privado del negocio (mándaselo al dueño — con él configura su propia clave la primera vez):
         </p>
         <div className="text-xs rounded-sm p-3 mb-3 break-all" style={{ background: "#fff", border: `1px solid ${ink}22`, color: ink }}>
           {linkNegocio(resumen.acceso_token)}
@@ -433,11 +442,19 @@ function FormularioCliente({ pin, onCreated, onError, onToast }) {
           Copiar link privado
         </button>
         <button
-          onClick={onCreated}
-          className="w-full py-2.5 rounded-sm font-bold text-sm uppercase"
+          onClick={() => { limpiarParaOtro(); onCreatedKeepOpen && onCreatedKeepOpen(); }}
+          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-sm font-bold text-sm uppercase mb-2"
           style={{ background: brass, color: ink }}
         >
-          Listo
+          <Plus size={15} />
+          Agregar otro cliente
+        </button>
+        <button
+          onClick={onCreated}
+          className="w-full py-2 rounded-sm font-bold text-xs uppercase"
+          style={{ background: "transparent", color: steel, border: `1px solid ${steel}55` }}
+        >
+          Ver lista y salir del formulario
         </button>
       </div>
     );
@@ -453,7 +470,9 @@ function FormularioCliente({ pin, onCreated, onError, onToast }) {
       <input
         value={nombreNegocio}
         onChange={(e) => setNombreNegocio(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && crear()}
         placeholder="Ej. Restaurante El Faro"
+        autoFocus
         className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-3"
         style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
       />
@@ -479,30 +498,43 @@ function FormularioCliente({ pin, onCreated, onError, onToast }) {
         ))}
       </div>
 
-      <label className="text-xs font-bold block mb-1" style={{ color: ink + "99" }}>Nombre del dueño (opcional)</label>
-      <input
-        value={nombreDueno}
-        onChange={(e) => setNombreDueno(e.target.value)}
-        className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-3"
-        style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-      />
+      <button
+        type="button"
+        onClick={() => setShowDueno((v) => !v)}
+        className="text-xs font-bold uppercase mb-3"
+        style={{ color: sage }}
+      >
+        {showDueno ? "− Ocultar datos del dueño" : "+ Agregar datos del dueño (opcional)"}
+      </button>
 
-      <label className="text-xs font-bold block mb-1" style={{ color: ink + "99" }}>Correo del dueño (opcional)</label>
-      <input
-        value={emailDueno}
-        onChange={(e) => setEmailDueno(e.target.value)}
-        type="email"
-        className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-3"
-        style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-      />
+      {showDueno && (
+        <>
+          <label className="text-xs font-bold block mb-1" style={{ color: ink + "99" }}>Nombre del dueño</label>
+          <input
+            value={nombreDueno}
+            onChange={(e) => setNombreDueno(e.target.value)}
+            className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-3"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
 
-      <label className="text-xs font-bold block mb-1" style={{ color: ink + "99" }}>Teléfono del dueño (opcional)</label>
-      <input
-        value={telefonoDueno}
-        onChange={(e) => setTelefonoDueno(e.target.value)}
-        className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-4"
-        style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-      />
+          <label className="text-xs font-bold block mb-1" style={{ color: ink + "99" }}>Correo del dueño</label>
+          <input
+            value={emailDueno}
+            onChange={(e) => setEmailDueno(e.target.value)}
+            type="email"
+            className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-3"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+
+          <label className="text-xs font-bold block mb-1" style={{ color: ink + "99" }}>Teléfono del dueño</label>
+          <input
+            value={telefonoDueno}
+            onChange={(e) => setTelefonoDueno(e.target.value)}
+            className="w-full px-3 py-2 rounded-sm text-sm outline-none mb-3"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+        </>
+      )}
 
       <div className="text-xs rounded-sm p-3 mb-4" style={{ background: "#fff", border: `1px solid ${ink}22`, color: ink + "aa" }}>
         Resumen: <b>{nombreNegocio || "(nombre del negocio)"}</b> — plan <b>{info.nombre}</b>, {money(info.precio)}.
