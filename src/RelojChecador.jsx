@@ -41,36 +41,62 @@ const SUPABASE_ANON_KEY = "sb_publishable_7BqQa6MCxW8qfyAuCgOQVg_HTnSuu9X";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-/* Reemplazan a window.storage: usan la tabla kv_store_reloj_checador de Supabase
-   (proyecto compartido con PAR, pero con tabla propia para no mezclar datos). */
+/* ------------------------------------------------------------
+   Multi-negocio: cada negocio tiene su propio link privado con un
+   token en la URL (?negocio=xxxx). Ese token es lo que separa los
+   datos de un cliente de los de otro — se lee una sola vez al cargar
+   la página (no cambia durante la sesión).
+   ------------------------------------------------------------ */
+function leerAccesoToken() {
+  try {
+    return new URLSearchParams(window.location.search).get("negocio") || "";
+  } catch {
+    return "";
+  }
+}
+const ACCESO_TOKEN = leerAccesoToken();
+
+/* Reemplazan a window.storage: usan la tabla kv_store_reloj_checador de Supabase,
+   ya separada por negocio — cada lectura/escritura manda el token del negocio y
+   la función en la base de datos se encarga de no mezclar datos entre negocios. */
 async function kvGet(key) {
-  const { data, error } = await supabase.from("kv_store_reloj_checador").select("value").eq("key", key).maybeSingle();
+  const { data, error } = await supabase.rpc("kv_leer_reloj", { p_acceso_token: ACCESO_TOKEN, p_clave: key });
   if (error) throw error;
-  return data ? data.value : null;
+  return data ?? null;
 }
 
 async function kvSet(key, value) {
-  const { error } = await supabase
-    .from("kv_store_reloj_checador")
-    .upsert({ key, value, updated_at: new Date().toISOString() });
+  const { data, error } = await supabase.rpc("kv_guardar_reloj", {
+    p_acceso_token: ACCESO_TOKEN,
+    p_clave: key,
+    p_valor: value,
+  });
   if (error) throw error;
-  return true;
+  return !!data;
 }
 
 /* Nómina, propinas, personal externo y el resto de lo que en la app solo se ve tras
-   ingresar el PIN de acceso YA NO vive en la tabla abierta: las políticas de la base de
+   ingresar la clave de acceso YA NO vive en la tabla abierta: las funciones de la base de
    datos bloquean esas claves para cualquiera que no pase por aquí, y aquí mismo se exige
-   otra vez el PIN correcto en cada lectura/escritura (ver migración protege_datos_sensibles). */
-async function leerDatoProtegido(clave, pin) {
-  const { data, error } = await supabase.rpc("leer_dato_protegido_reloj", { p_clave: clave, p_pin: pin });
+   otra vez el token del negocio + el nombre y la clave individual del Dueño/Gerente en
+   cada lectura/escritura (ver migración separacion_datos_multi_negocio). */
+async function leerDatoProtegido(clave, usuarioNombre, pin) {
+  const { data, error } = await supabase.rpc("dato_protegido_leer_reloj", {
+    p_acceso_token: ACCESO_TOKEN,
+    p_clave: clave,
+    p_usuario_nombre: usuarioNombre,
+    p_pin: pin,
+  });
   if (error) throw error;
-  return data; // string guardado, o null si no existe / el PIN no es correcto
+  return data; // string guardado, o null si no existe / la clave no es correcta
 }
 
-async function guardarDatoProtegido(clave, valor, pin) {
-  const { data, error } = await supabase.rpc("guardar_dato_protegido_reloj", {
+async function guardarDatoProtegido(clave, valor, usuarioNombre, pin) {
+  const { data, error } = await supabase.rpc("dato_protegido_guardar_reloj", {
+    p_acceso_token: ACCESO_TOKEN,
     p_clave: clave,
     p_valor: valor,
+    p_usuario_nombre: usuarioNombre,
     p_pin: pin,
   });
   if (error) throw error;
@@ -1776,20 +1802,44 @@ function PayrollPanel({
 export default function RelojChecador() {
   const [tab, setTab] = useState("checador");
 
-  // ---------- access pin (protects Bitácora, Nómina, Ajustes, etc.) ----------
-  // El PIN real ya NO se descarga nunca al navegador: solo sabemos si ya hay
-  // uno configurado (pinConfigured) y validamos cada intento contra Supabase
-  // con la función verify_app_pin, que solo contesta true/false.
-  // Declarado aquí arriba (y no más abajo, donde vive el resto del código del PIN)
-  // porque varias funciones de guardado protegido (nómina, ajustes, configuración
-  // del negocio) lo usan antes en el archivo, y en JS un "const"/"useState" no se
+  // ---------- token del negocio (separa los datos de cada cliente) ----------
+  // undefined = todavía verificando, true = negocio válido, false = link inválido/vencido.
+  const [tokenValido, setTokenValido] = useState(undefined);
+
+  useEffect(() => {
+    if (!ACCESO_TOKEN) {
+      setTokenValido(false);
+      return;
+    }
+    (async () => {
+      try {
+        const { data, error } = await supabase.rpc("token_valido_reloj", { p_acceso_token: ACCESO_TOKEN });
+        if (error) throw error;
+        setTokenValido(!!data);
+      } catch {
+        setTokenValido(false);
+      }
+    })();
+  }, []);
+
+  // ---------- clave de acceso individual (protege Bitácora, Nómina, Ajustes, etc.) ----------
+  // La clave real ya NO se descarga nunca al navegador: solo sabemos si ya hay al
+  // menos un Dueño/Gerente configurado en este negocio (usuariosConfigurados) y
+  // validamos cada intento contra Supabase con usuario_verificar_reloj, que solo
+  // contesta el rol si el nombre+clave son correctos (o nada si no lo son).
+  // Declarado aquí arriba (y no más abajo, donde vive el resto del código) porque
+  // varias funciones de guardado protegido (nómina, ajustes, configuración del
+  // negocio) lo usan antes en el archivo, y en JS un "const"/"useState" no se
   // puede usar antes de la línea donde se declara.
-  const [pinConfigured, setPinConfigured] = useState(undefined); // undefined = cargando, true/false
+  const [usuariosConfigurados, setUsuariosConfigurados] = useState(undefined); // undefined = cargando, true/false
   const [unlockedSession, setUnlockedSession] = useState(false);
-  // Guarda el PIN ya verificado SOLO en memoria (nunca en localStorage ni en Supabase),
-  // mientras la sesión sigue desbloqueada. Nómina, propinas, personal externo, etc. viven
-  // en la base de datos protegidas por este mismo PIN (ver migración protege_datos_sensibles),
-  // así que cada lectura/escritura de esos datos necesita volver a mandarlo.
+  const [rolActivo, setRolActivo] = useState(null); // 'dueno' | 'gerente' | null
+  // Guardan el nombre y la clave ya verificados SOLO en memoria (nunca en localStorage
+  // ni en Supabase), mientras la sesión sigue desbloqueada. Nómina, propinas, personal
+  // externo, etc. viven en la base de datos protegidas por esta misma clave individual
+  // (ver migración separacion_datos_multi_negocio), así que cada lectura/escritura de
+  // esos datos necesita volver a mandarla, junto con quién la usó.
+  const verifiedUsuarioRef = useRef("");
   const verifiedPinRef = useRef("");
 
   const [employees, setEmployees] = useState([]);
@@ -2089,7 +2139,7 @@ export default function RelojChecador() {
     const draft = businessConfigDraft;
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("business_config", JSON.stringify(draft), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("business_config", JSON.stringify(draft), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2143,7 +2193,7 @@ export default function RelojChecador() {
     (async () => {
       setLoadingPayrollRuns(true);
       try {
-        const val = await leerDatoProtegido("payroll_runs", verifiedPinRef.current);
+        const val = await leerDatoProtegido("payroll_runs", verifiedUsuarioRef.current, verifiedPinRef.current);
         setPayrollRuns(val ? JSON.parse(val) : []);
       } catch {
         setPayrollRuns([]);
@@ -2196,7 +2246,7 @@ export default function RelojChecador() {
     const actualizado = [run, ...payrollRuns].slice(0, 200);
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("payroll_runs", JSON.stringify(actualizado), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("payroll_runs", JSON.stringify(actualizado), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2236,7 +2286,7 @@ export default function RelojChecador() {
     const actualizado = payrollRuns.filter((r) => r.id !== id);
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("payroll_runs", JSON.stringify(actualizado), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("payroll_runs", JSON.stringify(actualizado), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2316,7 +2366,7 @@ export default function RelojChecador() {
     };
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("propinas_config", JSON.stringify(cfg), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("propinas_config", JSON.stringify(cfg), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2399,7 +2449,7 @@ export default function RelojChecador() {
     if (!unlockedSession) return;
     (async () => {
       try {
-        const val = await leerDatoProtegido("ajustes_manuales_log", verifiedPinRef.current);
+        const val = await leerDatoProtegido("ajustes_manuales_log", verifiedUsuarioRef.current, verifiedPinRef.current);
         setAjustesLog(val ? JSON.parse(val) : []);
       } catch {
         setAjustesLog([]);
@@ -2435,7 +2485,7 @@ export default function RelojChecador() {
     // queda bien se toca el registro real, para no dejar un cambio a medias.
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("ajustes_manuales_log", JSON.stringify(actualizadoLog), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("ajustes_manuales_log", JSON.stringify(actualizadoLog), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2483,7 +2533,7 @@ export default function RelojChecador() {
     (async () => {
       setLoadingActas(true);
       try {
-        const val = await leerDatoProtegido("actas_administrativas", verifiedPinRef.current);
+        const val = await leerDatoProtegido("actas_administrativas", verifiedUsuarioRef.current, verifiedPinRef.current);
         setActas(val ? JSON.parse(val) : []);
       } catch {
         setActas([]);
@@ -2580,7 +2630,7 @@ export default function RelojChecador() {
     const actualizado = [nueva, ...actas];
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("actas_administrativas", JSON.stringify(actualizado), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("actas_administrativas", JSON.stringify(actualizado), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2598,7 +2648,7 @@ export default function RelojChecador() {
     const actualizado = actas.filter((a) => a.id !== id);
     let ok = false;
     try {
-      ok = await guardarDatoProtegido("actas_administrativas", JSON.stringify(actualizado), verifiedPinRef.current);
+      ok = await guardarDatoProtegido("actas_administrativas", JSON.stringify(actualizado), verifiedUsuarioRef.current, verifiedPinRef.current);
     } catch {
       ok = false;
     }
@@ -2846,52 +2896,64 @@ export default function RelojChecador() {
     setToast({ color: sage, text: `Datos de ${monthLabel(monthKeyStr)} borrados para todo el restaurante.` });
   }
 
-  // ---------- resto del sistema de PIN (pinConfigured, unlockedSession y verifiedPinRef
-  // ya quedaron declarados arriba, junto con el resto de los hooks del componente) ----------
-  const [pinModal, setPinModal] = useState(null); // {mode:'setup'|'unlock'|'change', target, value, confirmValue, oldValue, error, busy}
+  // ---------- resto del sistema de identificación (usuariosConfigurados, unlockedSession
+  // y verifiedUsuarioRef/verifiedPinRef ya quedaron declarados arriba, junto con el resto
+  // de los hooks del componente) ----------
+  const [pinModal, setPinModal] = useState(null); // {mode:'setup'|'unlock'|'change', target, nombre, value, confirmValue, oldValue, error, busy}
 
   useEffect(() => {
+    if (tokenValido !== true) return;
     (async () => {
       try {
-        const { data, error } = await supabase.rpc("pin_exists", { p_pin_name: "reloj_access" });
+        const { data, error } = await supabase.rpc("usuarios_existen_reloj", { p_acceso_token: ACCESO_TOKEN });
         if (error) throw error;
-        setPinConfigured(!!data);
+        setUsuariosConfigurados(!!data);
       } catch {
-        setPinConfigured(false);
+        setUsuariosConfigurados(false);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [tokenValido]);
+
+  function abrirDestino(target) {
+    if (target === "bitacora" || target === "nomina" || target === "actas") setTab(target);
+    if (target === "propinas_historial") setShowPropinasHistorial(true);
+    if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
+    if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
+    if (target === "business_config_editar") setShowBusinessConfigEdit(true);
+  }
 
   function requestUnlock(target) {
-    if (pinConfigured === undefined) {
-      // Todavía no termina de consultar si hay PIN configurado.
-      // Si seguimos de largo aquí, la app puede creer que "no hay PIN configurado"
-      // y ofrecer crear uno nuevo, sobreescribiendo en silencio la clave real.
+    if (usuariosConfigurados === undefined) {
+      // Todavía no termina de consultar si ya hay usuarios configurados en este negocio.
+      // Si seguimos de largo aquí, la app puede creer que "no hay nadie configurado"
+      // y ofrecer crear una cuenta nueva, sobreescribiendo en silencio la del Dueño real.
       setToast({ color: steel, text: "Un momento, cargando… vuelve a intentar en un segundo." });
       return;
     }
     if (unlockedSession) {
-      if (target === "bitacora" || target === "nomina" || target === "actas") setTab(target);
-      if (target === "propinas_historial") setShowPropinasHistorial(true);
-      if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
-      if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
-      if (target === "business_config_editar") setShowBusinessConfigEdit(true);
+      if (target === "business_config_editar" && rolActivo !== "dueno") {
+        setToast({ color: paprika, text: "Solo el Dueño puede editar la configuración del negocio." });
+        return;
+      }
+      abrirDestino(target);
       return;
     }
-    if (!pinConfigured) {
-      setPinModal({ mode: "setup", target, value: "", confirmValue: "", error: "" });
+    if (!usuariosConfigurados) {
+      setPinModal({ mode: "setup", target, nombre: "", value: "", confirmValue: "", error: "" });
     } else {
-      setPinModal({ mode: "unlock", target, value: "", error: "" });
+      setPinModal({ mode: "unlock", target, nombre: "", value: "", error: "" });
     }
   }
 
   function openChangePin() {
-    setPinModal({ mode: "change", target: null, value: "", confirmValue: "", oldValue: "", error: "" });
+    setPinModal({ mode: "change", target: null, nombre: verifiedUsuarioRef.current, value: "", confirmValue: "", oldValue: "", error: "" });
   }
 
   function lockNow() {
     setUnlockedSession(false);
+    setRolActivo(null);
+    verifiedUsuarioRef.current = "";
     verifiedPinRef.current = "";
     setShowPropinasHistorial(false);
     setShowPropinasConfigEdit(false);
@@ -2902,39 +2964,89 @@ export default function RelojChecador() {
 
   async function submitPin() {
     if (!pinModal || pinModal.busy) return;
+    const nombre = (pinModal.nombre || "").trim();
     const digits = pinModal.value.trim();
 
     if (pinModal.mode === "unlock") {
+      if (!nombre) {
+        setPinModal((m) => ({ ...m, error: "Escribe tu nombre." }));
+        return;
+      }
+      setPinModal((m) => ({ ...m, busy: true, error: "" }));
+      let rol = null;
+      try {
+        const { data, error } = await supabase.rpc("usuario_verificar_reloj", {
+          p_acceso_token: ACCESO_TOKEN,
+          p_usuario_nombre: nombre,
+          p_pin: digits,
+        });
+        if (error) throw error;
+        rol = data || null;
+      } catch {
+        setPinModal((m) => ({ ...m, busy: false, error: "No se pudo verificar. Revisa tu conexión." }));
+        return;
+      }
+      if (!rol) {
+        setPinModal((m) => ({ ...m, busy: false, value: "", error: "Nombre o clave incorrectos." }));
+        return;
+      }
+      verifiedUsuarioRef.current = nombre;
+      verifiedPinRef.current = digits;
+      setRolActivo(rol);
+      setUnlockedSession(true);
+      const target = pinModal.target;
+      setPinModal(null);
+      if (target === "business_config_editar" && rol !== "dueno") {
+        setToast({ color: paprika, text: "Solo el Dueño puede editar la configuración del negocio." });
+        return;
+      }
+      abrirDestino(target);
+      return;
+    }
+
+    if (pinModal.mode === "change") {
+      if (digits.length < 4) {
+        setPinModal((m) => ({ ...m, error: "Usa al menos 4 dígitos." }));
+        return;
+      }
+      if (digits !== pinModal.confirmValue.trim()) {
+        setPinModal((m) => ({ ...m, error: "Las claves no coinciden." }));
+        return;
+      }
+      if (pinModal.oldValue.trim().length < 4) {
+        setPinModal((m) => ({ ...m, error: "Ingresa tu clave actual." }));
+        return;
+      }
       setPinModal((m) => ({ ...m, busy: true, error: "" }));
       let ok = false;
       try {
-        const { data, error } = await supabase.rpc("verify_app_pin", {
-          p_pin_name: "reloj_access",
-          p_pin: digits,
+        const { data, error } = await supabase.rpc("usuario_cambiar_pin_reloj", {
+          p_acceso_token: ACCESO_TOKEN,
+          p_usuario_nombre: nombre,
+          p_pin_actual: pinModal.oldValue.trim(),
+          p_pin_nuevo: digits,
         });
         if (error) throw error;
         ok = !!data;
       } catch {
-        setPinModal((m) => ({ ...m, busy: false, error: "No se pudo verificar la clave. Revisa tu conexión." }));
+        setPinModal((m) => ({ ...m, busy: false, error: "No se pudo guardar la clave. Revisa tu conexión." }));
         return;
       }
       if (!ok) {
-        setPinModal((m) => ({ ...m, busy: false, value: "", error: "Clave incorrecta." }));
+        setPinModal((m) => ({ ...m, busy: false, error: "Tu clave actual no es correcta." }));
         return;
       }
       verifiedPinRef.current = digits;
-      setUnlockedSession(true);
-      const target = pinModal.target;
       setPinModal(null);
-      if (target === "bitacora" || target === "nomina" || target === "actas") setTab(target);
-      if (target === "propinas_historial") setShowPropinasHistorial(true);
-      if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
-      if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
-      if (target === "business_config_editar") setShowBusinessConfigEdit(true);
+      setToast({ color: sage, text: "Clave actualizada." });
       return;
     }
 
-    // setup / change
+    // setup — primera vez: se crea el Dueño de este negocio
+    if (!nombre) {
+      setPinModal((m) => ({ ...m, error: "Escribe tu nombre." }));
+      return;
+    }
     if (digits.length < 4) {
       setPinModal((m) => ({ ...m, error: "Usa al menos 4 dígitos." }));
       return;
@@ -2943,17 +3055,14 @@ export default function RelojChecador() {
       setPinModal((m) => ({ ...m, error: "Las claves no coinciden." }));
       return;
     }
-    if (pinModal.mode === "change" && pinModal.oldValue.trim().length < 4) {
-      setPinModal((m) => ({ ...m, error: "Ingresa tu clave actual." }));
-      return;
-    }
     setPinModal((m) => ({ ...m, busy: true, error: "" }));
     let ok = false;
     try {
-      const { data, error } = await supabase.rpc("set_app_pin", {
-        p_pin_name: "reloj_access",
-        p_new_pin: digits,
-        p_old_pin: pinModal.mode === "change" ? pinModal.oldValue.trim() : null,
+      const { data, error } = await supabase.rpc("usuario_crear_reloj", {
+        p_acceso_token: ACCESO_TOKEN,
+        p_nuevo_nombre: nombre,
+        p_nuevo_rol: "dueno",
+        p_nuevo_pin: digits,
       });
       if (error) throw error;
       ok = !!data;
@@ -2962,19 +3071,17 @@ export default function RelojChecador() {
       return;
     }
     if (!ok) {
-      setPinModal((m) => ({ ...m, busy: false, error: "Tu clave actual no es correcta." }));
+      setPinModal((m) => ({ ...m, busy: false, error: "No se pudo crear la cuenta. ¿Ya existe ese nombre?" }));
       return;
     }
+    verifiedUsuarioRef.current = nombre;
     verifiedPinRef.current = digits;
-    setPinConfigured(true);
+    setRolActivo("dueno");
+    setUsuariosConfigurados(true);
     setUnlockedSession(true);
     const target = pinModal.target;
     setPinModal(null);
-    if (target === "bitacora" || target === "nomina") setTab(target);
-    if (target === "propinas_historial") setShowPropinasHistorial(true);
-    if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
-    if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
-    if (target === "business_config_editar") setShowBusinessConfigEdit(true);
+    abrirDestino(target);
   }
 
   // ---------- load employees ----------
@@ -4306,6 +4413,28 @@ export default function RelojChecador() {
             </div>
           ))
         )}
+      </div>
+    );
+  }
+
+  // ---------- guardia de negocio: sin un link válido, no se muestra nada de la app ----------
+  if (tokenValido !== true) {
+    return (
+      <div className="min-h-screen w-full flex items-center justify-center p-6" style={{ background: charcoal }}>
+        <div className="w-full max-w-sm rounded-sm p-6 text-center" style={{ background: paper }}>
+          {tokenValido === undefined ? (
+            <p className="text-sm" style={{ color: ink + "99" }}>Cargando…</p>
+          ) : (
+            <>
+              <Lock size={22} color={paprika} className="mx-auto mb-2" />
+              <div className="text-sm font-bold mb-1" style={{ color: ink }}>Link no válido</div>
+              <p className="text-xs" style={{ color: ink + "99" }}>
+                Este enlace no corresponde a ningún negocio activo. Si crees que esto es un error,
+                contacta a quien te dio el acceso.
+              </p>
+            </>
+          )}
+        </div>
       </div>
     );
   }
@@ -6917,13 +7046,32 @@ export default function RelojChecador() {
 
             {pinModal.mode === "setup" && (
               <p className="text-xs mb-3" style={{ color: ink + "aa" }}>
-                Esta clave se pedirá para ver la bitácora y para agregar personal nuevo.
+                Primera vez aquí: esta cuenta queda como Dueño del negocio. Esta clave se pedirá
+                para ver la bitácora, nómina, actas y para agregar personal nuevo.
               </p>
+            )}
+            {pinModal.mode === "change" && (
+              <p className="text-xs mb-3" style={{ color: ink + "aa" }}>
+                Cambiando la clave de <b>{pinModal.nombre || "tu cuenta"}</b>.
+              </p>
+            )}
+
+            {(pinModal.mode === "unlock" || pinModal.mode === "setup") && (
+              <input
+                autoFocus
+                type="text"
+                autoCapitalize="words"
+                value={pinModal.nombre}
+                onChange={(e) => setPinModal((m) => ({ ...m, nombre: e.target.value, error: "" }))}
+                placeholder="Tu nombre"
+                disabled={pinModal.busy}
+                className="w-full px-3 py-2.5 rounded-sm text-sm outline-none mb-2"
+                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+              />
             )}
 
             {pinModal.mode === "unlock" ? (
               <input
-                autoFocus
                 type="password"
                 inputMode="numeric"
                 maxLength={8}
@@ -6941,6 +7089,7 @@ export default function RelojChecador() {
               <div className="flex flex-col gap-2 mb-2">
                 {pinModal.mode === "change" && (
                   <input
+                    autoFocus
                     type="password"
                     inputMode="numeric"
                     maxLength={8}
@@ -6955,7 +7104,6 @@ export default function RelojChecador() {
                   />
                 )}
                 <input
-                  autoFocus={pinModal.mode !== "change"}
                   type="password"
                   inputMode="numeric"
                   maxLength={8}
