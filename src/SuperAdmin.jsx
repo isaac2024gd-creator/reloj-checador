@@ -50,6 +50,21 @@ function money(n) {
   return `$${Number(n).toLocaleString("es-MX")} MXN/mes`;
 }
 
+// Link privado del negocio: la misma app, apuntando a sus propios datos.
+function linkNegocio(token) {
+  return `${window.location.origin}${window.location.pathname}?negocio=${token}`;
+}
+
+async function copiarLink(token, onDone) {
+  const link = linkNegocio(token);
+  try {
+    await navigator.clipboard.writeText(link);
+    onDone && onDone(true);
+  } catch {
+    onDone && onDone(false, link);
+  }
+}
+
 export default function SuperAdmin() {
   // ---------- acceso con PIN propio (independiente del PIN del restaurante) ----------
   const [pinConfigured, setPinConfigured] = useState(undefined);
@@ -262,9 +277,9 @@ function PanelClientes() {
         >
           <AlertTriangle size={14} color={brass} className="flex-shrink-0 mt-0.5" />
           <span>
-            Esta pantalla solo guarda el directorio de negocios. El Checador, Bitácora y Nómina de la app
-            <b> todavía son compartidos entre todos los clientes</b> — la separación real de datos es el
-            siguiente paso. No des de alta clientes reales todavía.
+            Los datos de cada negocio ya están separados (cada uno con su propio link privado, abajo).
+            <b> Todavía falta:</b> la pantalla para que el dueño agregue a su equipo con rol, y automatizar
+            el envío del correo de invitación (por ahora se lo mandas tú a mano).
           </span>
         </div>
 
@@ -277,7 +292,14 @@ function PanelClientes() {
           {showForm ? "Cerrar formulario" : "Agregar cliente"}
         </button>
 
-        {showForm && <FormularioCliente pin={pin} onCreated={() => { setShowForm(false); loadClientes(); setToast({ text: "Cliente creado." }); }} onError={(msg) => setToast({ error: true, text: msg })} />}
+        {showForm && (
+          <FormularioCliente
+            pin={pin}
+            onCreated={() => { setShowForm(false); loadClientes(); setToast({ text: "Cliente creado." }); }}
+            onError={(msg) => setToast({ error: true, text: msg })}
+            onToast={(text) => setToast({ text })}
+          />
+        )}
 
         <div className="rounded-sm p-4" style={{ background: paper }}>
           <div className="text-xs font-bold uppercase mb-3" style={{ color: ink, letterSpacing: "0.06em" }}>
@@ -288,24 +310,37 @@ function PanelClientes() {
           )}
           <div className="flex flex-col gap-2">
             {clientes.map((c) => (
-              <div key={c.id} className="flex items-center justify-between rounded-sm p-3" style={{ border: `1px solid ${ink}22` }}>
-                <div>
-                  <div className="text-sm font-bold" style={{ color: ink }}>{c.nombre_negocio}</div>
-                  <div className="text-xs" style={{ color: ink + "88" }}>
-                    {PLANES[c.plan]?.nombre || c.plan} · {money(c.precio_mensual)}
-                    {c.nombre_dueno ? ` · ${c.nombre_dueno}` : ""}
-                    {c.email_dueno ? ` · ${c.email_dueno}` : ""}
+              <div key={c.id} className="rounded-sm p-3" style={{ border: `1px solid ${ink}22` }}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-bold" style={{ color: ink }}>{c.nombre_negocio}</div>
+                    <div className="text-xs" style={{ color: ink + "88" }}>
+                      {PLANES[c.plan]?.nombre || c.plan} · {money(c.precio_mensual)}
+                      {c.nombre_dueno ? ` · ${c.nombre_dueno}` : ""}
+                      {c.email_dueno ? ` · ${c.email_dueno}` : ""}
+                    </div>
                   </div>
+                  <span
+                    className="text-xs font-bold uppercase px-2 py-1 rounded-sm flex-shrink-0"
+                    style={{
+                      color: c.estado === "activo" ? sage : paprika,
+                      border: `1px solid ${c.estado === "activo" ? sage : paprika}55`,
+                    }}
+                  >
+                    {c.estado}
+                  </span>
                 </div>
-                <span
-                  className="text-xs font-bold uppercase px-2 py-1 rounded-sm"
-                  style={{
-                    color: c.estado === "activo" ? sage : paprika,
-                    border: `1px solid ${c.estado === "activo" ? sage : paprika}55`,
-                  }}
+                <button
+                  onClick={() =>
+                    copiarLink(c.acceso_token, (ok, link) =>
+                      setToast(ok ? { text: "Link copiado." } : { error: true, text: `Copia a mano: ${link}` })
+                    )
+                  }
+                  className="text-xs font-bold uppercase mt-2"
+                  style={{ color: sage }}
                 >
-                  {c.estado}
-                </span>
+                  Copiar link privado
+                </button>
               </div>
             ))}
           </div>
@@ -324,7 +359,7 @@ function PanelClientes() {
   );
 }
 
-function FormularioCliente({ pin, onCreated, onError }) {
+function FormularioCliente({ pin, onCreated, onError, onToast }) {
   const [nombreNegocio, setNombreNegocio] = useState("");
   const [plan, setPlan] = useState("basico");
   const [nombreDueno, setNombreDueno] = useState("");
@@ -379,6 +414,24 @@ function FormularioCliente({ pin, onCreated, onError }) {
           {resumen.email_dueno && <div><b>Correo:</b> {resumen.email_dueno}</div>}
           {resumen.telefono_dueno && <div><b>Teléfono:</b> {resumen.telefono_dueno}</div>}
         </div>
+
+        <p className="text-xs mb-2" style={{ color: ink + "99" }}>
+          Su link privado (mándaselo junto con lo de arriba — con él configura su propia clave la primera vez):
+        </p>
+        <div className="text-xs rounded-sm p-3 mb-3 break-all" style={{ background: "#fff", border: `1px solid ${ink}22`, color: ink }}>
+          {linkNegocio(resumen.acceso_token)}
+        </div>
+        <button
+          onClick={() =>
+            copiarLink(resumen.acceso_token, (ok, link) =>
+              ok ? onToast("Link copiado.") : onError(`Copia a mano: ${link}`)
+            )
+          }
+          className="w-full py-2.5 rounded-sm font-bold text-sm uppercase mb-2"
+          style={{ background: sage, color: paper }}
+        >
+          Copiar link privado
+        </button>
         <button
           onClick={onCreated}
           className="w-full py-2.5 rounded-sm font-bold text-sm uppercase"
